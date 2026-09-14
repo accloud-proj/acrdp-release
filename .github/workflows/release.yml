@@ -1,0 +1,233 @@
+name: Build and publish ACRDP
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Source and release tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_DIR: source
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - name: Validate version
+        id: version
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag must use vMAJOR.MINOR.PATCH format, got: $REQUESTED_TAG" >&2
+            exit 1
+          fi
+          echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${REQUESTED_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve build targets
+        id: targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix='[{"runner":"windows-latest","rid":"win-x64","artifact":"windows-x64","format":"zip"},{"runner":"windows-latest","rid":"win-x86","artifact":"windows-x86","format":"zip"},{"runner":"windows-latest","rid":"win-arm64","artifact":"windows-arm64","format":"zip"},{"runner":"ubuntu-24.04","rid":"linux-x64","artifact":"linux-x64","format":"tar"},{"runner":"ubuntu-24.04","rid":"linux-x86","artifact":"linux-x86","format":"tar"},{"runner":"ubuntu-24.04-arm","rid":"linux-arm64","artifact":"linux-arm64","format":"tar"},{"runner":"macos-15-intel","rid":"osx-x64","artifact":"macos-x64","format":"tar"},{"runner":"macos-15","rid":"osx-arm64","artifact":"macos-arm64","format":"tar"}]'
+          echo "matrix={\"include\":$matrix}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Clone private source tag
+        shell: pwsh
+        env:
+          SOURCE_TAG: ${{ needs.prepare.outputs.tag }}
+          GITEA_SSH_HOST: ${{ secrets.GITEA_SSH_HOST }}
+          GITEA_SSH_HOST_KEY: ${{ secrets.GITEA_SSH_HOST_KEY }}
+          GITEA_SSH_PRIVATE_KEY_BASE64: ${{ secrets.GITEA_SSH_PRIVATE_KEY_BASE64 }}
+          GITEA_SOURCE_REPOSITORY: ${{ secrets.GITEA_SOURCE_REPOSITORY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $requiredSecrets = @(
+            'GITEA_SSH_HOST',
+            'GITEA_SSH_HOST_KEY',
+            'GITEA_SSH_PRIVATE_KEY_BASE64',
+            'GITEA_SOURCE_REPOSITORY'
+          )
+          foreach ($secretName in $requiredSecrets) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($secretName))) {
+              throw "$secretName is empty or unavailable to this workflow."
+            }
+          }
+
+          $sshDirectory = Join-Path $env:RUNNER_TEMP 'acrdp-ssh'
+          New-Item -ItemType Directory -Path $sshDirectory -Force | Out-Null
+          try {
+            $privateKey = Join-Path $sshDirectory 'id_ed25519'
+            $knownHosts = Join-Path $sshDirectory 'known_hosts'
+            [IO.File]::WriteAllBytes($privateKey, [Convert]::FromBase64String($env:GITEA_SSH_PRIVATE_KEY_BASE64))
+            [IO.File]::WriteAllText($knownHosts, "$env:GITEA_SSH_HOST_KEY`n", [Text.UTF8Encoding]::new($false))
+            if (-not $IsWindows) { chmod 600 $privateKey $knownHosts }
+
+            & ssh-keygen -y -f $privateKey | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'The decoded deploy key is not a valid private key.' }
+            & ssh-keygen -F $env:GITEA_SSH_HOST -f $knownHosts | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'The pinned Gitea host key is invalid.' }
+
+            $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=`"$knownHosts`" -i `"$privateKey`""
+            git clone --depth 1 --branch $env:SOURCE_TAG $env:GITEA_SOURCE_REPOSITORY $env:SOURCE_DIR
+            if ($LASTEXITCODE -ne 0) { throw "Unable to clone source tag $env:SOURCE_TAG." }
+          }
+          finally {
+            Remove-Item -Recurse -Force $sshDirectory -ErrorAction SilentlyContinue
+            Remove-Item Env:GIT_SSH_COMMAND -ErrorAction SilentlyContinue
+          }
+
+      - name: Resolve .NET SDK and project
+        id: project
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $globalJson = Join-Path $env:SOURCE_DIR 'global.json'
+          if (Test-Path $globalJson) {
+            $sdkVersion = (Get-Content $globalJson -Raw | ConvertFrom-Json).sdk.version
+          }
+          else {
+            $sdkVersion = '10.0.x'
+          }
+          if ([string]::IsNullOrWhiteSpace($sdkVersion)) { throw 'global.json does not define sdk.version.' }
+
+          $projects = Get-ChildItem $env:SOURCE_DIR -Recurse -Filter '*.csproj' | Where-Object {
+            $_.FullName -notmatch '[\\/](test|tests)[\\/]' -and
+            (Select-String -Path $_.FullName -Pattern '<OutputType>\s*(Exe|WinExe)\s*</OutputType>' -Quiet)
+          }
+          if ($projects.Count -ne 1) {
+            throw "Expected exactly one executable project, found $($projects.Count): $($projects.FullName -join ', ')"
+          }
+
+          $eazFiles = Get-ChildItem $env:SOURCE_DIR -Recurse -File -Include '*.csproj','*.props','*.targets' | Where-Object {
+            Select-String -Path $_.FullName -Pattern 'Eazfuscator' -Quiet
+          }
+          if (-not $eazFiles) { throw 'No Eazfuscator.NET MSBuild/NuGet integration was found in the source repository.' }
+
+          "sdk_version=$sdkVersion" >> $env:GITHUB_OUTPUT
+          "project_path=$($projects[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ steps.project.outputs.sdk_version }}
+
+      - name: Publish obfuscated application
+        shell: pwsh
+        env:
+          PROJECT_PATH: ${{ steps.project.outputs.project_path }}
+          RID: ${{ matrix.rid }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          EAZFUSCATOR_NET_LICENSE: ${{ secrets.EAZFUSCATOR_NET_LICENSE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $publishDirectory = Join-Path $env:RUNNER_TEMP "publish-$env:RID"
+          dotnet publish $env:PROJECT_PATH `
+            --configuration Release `
+            --runtime $env:RID `
+            --self-contained true `
+            --output $publishDirectory `
+            -p:Version=$env:VERSION `
+            -p:ContinuousIntegrationBuild=true
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed for $env:RID." }
+          "PUBLISH_DIRECTORY=$publishDirectory" >> $env:GITHUB_ENV
+
+      - name: Package Windows build
+        if: matrix.format == 'zip'
+        shell: pwsh
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $package = "dist/acrdp-client_$env:VERSION`_$env:ARTIFACT.zip"
+          Compress-Archive -Path "$env:PUBLISH_DIRECTORY/*" -DestinationPath $package
+          $fileName = Split-Path $package -Leaf
+          $hash = (Get-FileHash -Path $package -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$package.sha256", "$hash  $fileName`n", [Text.UTF8Encoding]::new($false))
+
+      - name: Package Unix build
+        if: matrix.format == 'tar'
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          package="acrdp-client_${VERSION}_${ARTIFACT}.tar.gz"
+          tar -C "$PUBLISH_DIRECTORY" -czf "dist/$package" .
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "$package" > "$package.sha256")
+          else
+            (cd dist && shasum -a 256 "$package" > "$package.sha256")
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs:
+      - prepare
+      - build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          elif gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" dist/* \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --generate-notes
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TAG" \
+              --generate-notes
+          fi
