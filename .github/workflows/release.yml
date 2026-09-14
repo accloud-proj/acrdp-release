@@ -20,6 +20,7 @@ concurrency:
 
 env:
   SOURCE_DIR: source
+  APP_PROJECT: AcrdpClient/AcrdpClient.csproj
 
 jobs:
   prepare:
@@ -132,12 +133,12 @@ jobs:
           }
           if ([string]::IsNullOrWhiteSpace($sdkVersion)) { throw 'global.json does not define sdk.version.' }
 
-          $projects = Get-ChildItem $env:SOURCE_DIR -Recurse -Filter '*.csproj' | Where-Object {
-            $_.FullName -notmatch '[\\/](test|tests)[\\/]' -and
-            (Select-String -Path $_.FullName -Pattern '<OutputType>\s*(Exe|WinExe)\s*</OutputType>' -Quiet)
+          $projectPath = Join-Path $env:SOURCE_DIR $env:APP_PROJECT
+          if (-not (Test-Path $projectPath -PathType Leaf)) {
+            throw "Application project was not found: $env:APP_PROJECT"
           }
-          if ($projects.Count -ne 1) {
-            throw "Expected exactly one executable project, found $($projects.Count): $($projects.FullName -join ', ')"
+          if (-not (Select-String -Path $projectPath -Pattern '<OutputType>\s*(Exe|WinExe)\s*</OutputType>' -Quiet)) {
+            throw "Application project is not executable: $env:APP_PROJECT"
           }
 
           $eazFiles = Get-ChildItem $env:SOURCE_DIR -Recurse -File -Include '*.csproj','*.props','*.targets' | Where-Object {
@@ -146,7 +147,7 @@ jobs:
           if (-not $eazFiles) { throw 'No Eazfuscator.NET MSBuild/NuGet integration was found in the source repository.' }
 
           "sdk_version=$sdkVersion" >> $env:GITHUB_OUTPUT
-          "project_path=$($projects[0].FullName)" >> $env:GITHUB_OUTPUT
+          "project_path=$((Resolve-Path $projectPath).Path)" >> $env:GITHUB_OUTPUT
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v5
