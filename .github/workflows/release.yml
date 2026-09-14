@@ -167,7 +167,6 @@ jobs:
           dotnet publish $env:PROJECT_PATH `
             --configuration Release `
             --runtime $env:RID `
-            --self-contained true `
             --output $publishDirectory `
             -p:Version=$env:VERSION `
             -p:ContinuousIntegrationBuild=true
