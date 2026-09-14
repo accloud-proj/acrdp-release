@@ -85,9 +85,24 @@ jobs:
           try {
             $privateKey = Join-Path $sshDirectory 'id_ed25519'
             $knownHosts = Join-Path $sshDirectory 'known_hosts'
-            [IO.File]::WriteAllBytes($privateKey, [Convert]::FromBase64String($env:GITEA_SSH_PRIVATE_KEY_BASE64))
+            $privateKeyText = [Text.Encoding]::UTF8.GetString(
+              [Convert]::FromBase64String($env:GITEA_SSH_PRIVATE_KEY_BASE64)
+            ).Replace("`r`n", "`n").Replace("`r", "`n").Trim() + "`n"
+            if (-not $privateKeyText.StartsWith('-----BEGIN OPENSSH PRIVATE KEY-----') -or
+                -not $privateKeyText.TrimEnd().EndsWith('-----END OPENSSH PRIVATE KEY-----')) {
+              throw 'GITEA_SSH_PRIVATE_KEY_BASE64 must decode to a complete OpenSSH private key.'
+            }
+            [IO.File]::WriteAllText($privateKey, $privateKeyText, [Text.UTF8Encoding]::new($false))
             [IO.File]::WriteAllText($knownHosts, "$env:GITEA_SSH_HOST_KEY`n", [Text.UTF8Encoding]::new($false))
-            if (-not $IsWindows) { chmod 600 $privateKey $knownHosts }
+            if ($IsWindows) {
+              $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+              $grant = "*$currentUserSid`:(R)"
+              & icacls.exe $privateKey /inheritance:r /grant:r $grant | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw 'Unable to secure the deploy key ACL.' }
+            }
+            else {
+              chmod 600 $privateKey $knownHosts
+            }
 
             & ssh-keygen -y -f $privateKey | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'The decoded deploy key is not a valid private key.' }
