@@ -159,11 +159,20 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue) -and
-              -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
-            choco install innosetup --yes --no-progress
-            if ($LASTEXITCODE -ne 0) { throw 'Unable to install Inno Setup.' }
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
           }
+          if (-not (Test-Path $iscc)) { throw 'Inno Setup 6 was not found' }
+
+          $languageFile = Join-Path (Split-Path $iscc) 'Languages\ChineseSimplified.isl'
+          if (-not (Test-Path $languageFile)) {
+            New-Item -ItemType Directory -Path (Split-Path $languageFile) -Force | Out-Null
+            curl.exe --fail --location --retry 3 --output $languageFile 'https://raw.githubusercontent.com/jrsoftware/issrc/refs/heads/main/Files/Languages/ChineseSimplified.isl'
+            if ($LASTEXITCODE -ne 0) { throw "Failed to download ChineseSimplified.isl with exit code $LASTEXITCODE" }
+          }
+          if (-not (Test-Path $languageFile)) { throw 'Inno Setup ChineseSimplified.isl was not found' }
+          if ((Get-Content $languageFile -TotalCount 1) -notmatch 'Inno Setup version .* Chinese Simplified messages') { throw 'Invalid Inno Setup ChineseSimplified.isl' }
 
       - name: Install Linux packaging tools
         if: runner.os == 'Linux'
