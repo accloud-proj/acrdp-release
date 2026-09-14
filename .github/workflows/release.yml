@@ -49,7 +49,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          matrix='[{"runner":"windows-latest","rid":"win-x64","artifact":"windows-x64","format":"zip"},{"runner":"windows-latest","rid":"win-arm64","artifact":"windows-arm64","format":"zip"},{"runner":"ubuntu-24.04","rid":"linux-x64","artifact":"linux-x64","format":"tar"},{"runner":"ubuntu-24.04-arm","rid":"linux-arm64","artifact":"linux-arm64","format":"tar"},{"runner":"macos-15-intel","rid":"osx-x64","artifact":"macos-x64","format":"tar"},{"runner":"macos-15","rid":"osx-arm64","artifact":"macos-arm64","format":"tar"}]'
+          matrix='[{"runner":"windows-latest","rid":"win-x64","artifact":"windows-x64"},{"runner":"windows-latest","rid":"win-arm64","artifact":"windows-arm64"},{"runner":"ubuntu-24.04","rid":"linux-x64","artifact":"linux-x64"},{"runner":"ubuntu-24.04-arm","rid":"linux-arm64","artifact":"linux-arm64"},{"runner":"macos-15-intel","rid":"osx-x64","artifact":"macos-x64"},{"runner":"macos-15","rid":"osx-arm64","artifact":"macos-arm64"}]'
           echo "matrix={\"include\":$matrix}" >> "$GITHUB_OUTPUT"
 
   build:
@@ -154,61 +154,58 @@ jobs:
         with:
           dotnet-version: ${{ steps.project.outputs.sdk_version }}
 
-      - name: Publish obfuscated application
+      - name: Install Windows packaging tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to install Inno Setup.' }
+          }
+
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes ruby-full build-essential rpm
+          sudo gem install --no-document fpm
+
+      - name: Build installer packages
+        working-directory: source
         shell: pwsh
         env:
-          PROJECT_PATH: ${{ steps.project.outputs.project_path }}
           RID: ${{ matrix.rid }}
-          VERSION: ${{ needs.prepare.outputs.version }}
           EAZFUSCATOR_NET_LICENSE: ${{ secrets.EAZFUSCATOR_NET_LICENSE }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $publishDirectory = Join-Path $env:RUNNER_TEMP "publish-$env:RID"
-          dotnet publish $env:PROJECT_PATH `
-            --configuration Release `
-            --runtime $env:RID `
-            --output $publishDirectory `
-            -p:Version=$env:VERSION `
-            -p:ContinuousIntegrationBuild=true
-          if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed for $env:RID." }
-          "PUBLISH_DIRECTORY=$publishDirectory" >> $env:GITHUB_ENV
+          ./packaging/build-package.ps1 -RuntimeIdentifier $env:RID -ArtifactsDirectory artifacts
 
-      - name: Package Windows build
-        if: matrix.format == 'zip'
+      - name: Generate SHA-256 files
         shell: pwsh
         env:
-          ARTIFACT: ${{ matrix.artifact }}
-          VERSION: ${{ needs.prepare.outputs.version }}
+          RID: ${{ matrix.rid }}
         run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
-          $package = "dist/acrdp-client_$env:VERSION`_$env:ARTIFACT.zip"
-          Compress-Archive -Path "$env:PUBLISH_DIRECTORY/*" -DestinationPath $package
-          $fileName = Split-Path $package -Leaf
-          $hash = (Get-FileHash -Path $package -Algorithm SHA256).Hash.ToLowerInvariant()
-          [IO.File]::WriteAllText("$package.sha256", "$hash  $fileName`n", [Text.UTF8Encoding]::new($false))
-
-      - name: Package Unix build
-        if: matrix.format == 'tar'
-        shell: bash
-        env:
-          ARTIFACT: ${{ matrix.artifact }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          package="acrdp-client_${VERSION}_${ARTIFACT}.tar.gz"
-          tar -C "$PUBLISH_DIRECTORY" -czf "dist/$package" .
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd dist && sha256sum "$package" > "$package.sha256")
-          else
-            (cd dist && shasum -a 256 "$package" > "$package.sha256")
-          fi
+          $outputDirectory = Join-Path $env:SOURCE_DIR "artifacts/$env:RID"
+          $packages = @(Get-ChildItem $outputDirectory -File | Where-Object Extension -ne '.sha256')
+          if ($packages.Count -eq 0) { throw "No installer packages were created for $env:RID." }
+          foreach ($package in $packages) {
+            $hash = (Get-FileHash $package.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            [IO.File]::WriteAllText(
+              "$($package.FullName).sha256",
+              "$hash  $($package.Name)`n",
+              [Text.UTF8Encoding]::new($false)
+            )
+          }
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/*
+          path: source/artifacts/${{ matrix.rid }}/*
           if-no-files-found: error
 
   release:
