@@ -221,7 +221,6 @@ jobs:
     needs:
       - prepare
       - build
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -240,8 +239,10 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/* --clobber
-          elif gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release delete "$RELEASE_TAG" --yes
+          fi
+
+          if gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" dist/* \
               --verify-tag \
               --title "$RELEASE_TAG" \
@@ -254,6 +255,7 @@ jobs:
           fi
 
       - name: Publish packages to Linux host
+        if: ${{ github.event_name == 'push' }}
         env:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
@@ -291,12 +293,28 @@ jobs:
 
           python3 - "$private_key" <<'PY'
           import base64
+          import binascii
           import os
           import pathlib
           import sys
 
-          key = base64.b64decode(os.environ["DEPLOY_SSH_PRIVATE_KEY_BASE64"], validate=True)
+          value = os.environ["DEPLOY_SSH_PRIVATE_KEY_BASE64"].strip()
+          if value.startswith("-----BEGIN OPENSSH PRIVATE KEY-----"):
+              key = value.encode()
+          else:
+              try:
+                  key = base64.b64decode("".join(value.split()), validate=True)
+              except binascii.Error as error:
+                  raise SystemExit(
+                      "DEPLOY_SSH_PRIVATE_KEY_BASE64 must contain an OpenSSH private key "
+                      "or its Base64 encoding."
+                  )
           key = key.replace(b"\r\n", b"\n").replace(b"\r", b"\n").strip() + b"\n"
+          if (
+              not key.startswith(b"-----BEGIN OPENSSH PRIVATE KEY-----\n")
+              or not key.endswith(b"\n-----END OPENSSH PRIVATE KEY-----\n")
+          ):
+              raise SystemExit("The deploy secret does not contain an OpenSSH private key.")
           pathlib.Path(sys.argv[1]).write_bytes(key)
           PY
           printf '%s\n' "$DEPLOY_SSH_HOST_KEY" > "$known_hosts"
@@ -320,14 +338,16 @@ jobs:
           remote_directory="/www/wwwroot/accloud/acrdp/$RELEASE_TAG"
           ssh "${ssh_options[@]}" "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST" \
             "rm -rf -- '$remote_directory' && mkdir -p -- '$remote_directory'"
-          scp_options=("${ssh_options[@]}")
-          scp_options[${#scp_options[@]}-1]="$deploy_port"
-          scp_options[${#scp_options[@]}-2]=-P
-          scp "${scp_options[@]}" "${packages[@]}" \
+          if ! command -v rsync >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes rsync
+          fi
+          export RSYNC_RSH="ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts -i $private_key -p $deploy_port"
+          rsync --archive --delete dist/ \
             "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST:$remote_directory/"
 
       - name: Send Telegram notification
-        if: ${{ success() }}
+        if: ${{ github.event_name == 'push' && success() }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
