@@ -252,3 +252,117 @@ jobs:
               --title "$RELEASE_TAG" \
               --generate-notes
           fi
+
+      - name: Publish packages to Linux host
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
+          DEPLOY_SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          DEPLOY_SSH_HOST_KEY: ${{ secrets.DEPLOY_SSH_HOST_KEY }}
+          DEPLOY_SSH_PRIVATE_KEY_BASE64: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_secrets=(
+            DEPLOY_SSH_HOST
+            DEPLOY_SSH_USER
+            DEPLOY_SSH_HOST_KEY
+            DEPLOY_SSH_PRIVATE_KEY_BASE64
+          )
+          for secret_name in "${required_secrets[@]}"; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "$secret_name is empty or unavailable to this workflow." >&2
+              exit 1
+            fi
+          done
+
+          deploy_port="${DEPLOY_SSH_PORT:-22}"
+          if [[ ! "$deploy_port" =~ ^[0-9]+$ ]] || (( deploy_port < 1 || deploy_port > 65535 )); then
+            echo "DEPLOY_SSH_PORT must be a valid TCP port." >&2
+            exit 1
+          fi
+
+          ssh_directory="$RUNNER_TEMP/acrdp-deploy-ssh"
+          install -d -m 700 "$ssh_directory"
+          private_key="$ssh_directory/id_ed25519"
+          known_hosts="$ssh_directory/known_hosts"
+          trap 'rm -rf "$ssh_directory"' EXIT
+
+          python3 - "$private_key" <<'PY'
+          import base64
+          import os
+          import pathlib
+          import sys
+
+          key = base64.b64decode(os.environ["DEPLOY_SSH_PRIVATE_KEY_BASE64"], validate=True)
+          key = key.replace(b"\r\n", b"\n").replace(b"\r", b"\n").strip() + b"\n"
+          pathlib.Path(sys.argv[1]).write_bytes(key)
+          PY
+          printf '%s\n' "$DEPLOY_SSH_HOST_KEY" > "$known_hosts"
+          chmod 600 "$private_key" "$known_hosts"
+          ssh-keygen -y -f "$private_key" >/dev/null
+
+          mapfile -d '' packages < <(find dist -maxdepth 1 -type f -print0)
+          if (( ${#packages[@]} == 0 )); then
+            echo 'No release packages were found in dist.' >&2
+            exit 1
+          fi
+
+          ssh_options=(
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$known_hosts"
+            -i "$private_key"
+            -p "$deploy_port"
+          )
+          remote_directory="/www/wwwroot/accloud/acrdp/$RELEASE_TAG"
+          ssh "${ssh_options[@]}" "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST" \
+            "rm -rf -- '$remote_directory' && mkdir -p -- '$remote_directory'"
+          scp_options=("${ssh_options[@]}")
+          scp_options[${#scp_options[@]}-1]="$deploy_port"
+          scp_options[${#scp_options[@]}-2]=-P
+          scp "${scp_options[@]}" "${packages[@]}" \
+            "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST:$remote_directory/"
+
+      - name: Send Telegram notification
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          WORKER_DEPLOY_CHAT_ID: ${{ secrets.WORKER_DEPLOY_CHAT_ID }}
+          WORKER_DEPLOY_API_KEY: ${{ secrets.WORKER_DEPLOY_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${WORKER_DEPLOY_CHAT_ID:-}" || -z "${WORKER_DEPLOY_API_KEY:-}" ]]; then
+            echo 'WORKER_DEPLOY_CHAT_ID and WORKER_DEPLOY_API_KEY are required.' >&2
+            exit 1
+          fi
+
+          TAG_MESSAGE=''
+          tag_object="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG")"
+          if [[ "$(jq -r '.object.type' <<< "$tag_object")" == 'tag' ]]; then
+            tag_sha="$(jq -r '.object.sha' <<< "$tag_object")"
+            TAG_MESSAGE="$(gh api "repos/$GH_REPO/git/tags/$tag_sha" --jq '.message // ""')"
+          fi
+
+          run_started_at="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID" --jq '.run_started_at')"
+          start_seconds="$(date -d "$run_started_at" +%s)"
+          end_seconds="$(date +%s)"
+          total_seconds="$((end_seconds - start_seconds))"
+          deploy_time="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+          MESSAGE="$(printf '提示:\n\nacrdp-client 已经更新到: %s' "$VERSION")"
+          if [[ -n "${TAG_MESSAGE:-}" ]]; then
+            MESSAGE="$(printf '%s\n%s' "$MESSAGE" "$TAG_MESSAGE")"
+          fi
+          MESSAGE="$(printf '%s\n当前时间: %s\n共计时长: %ss' "$MESSAGE" "$deploy_time" "$total_seconds")"
+          payload="$(printf '%s' "$MESSAGE" | python3 -c 'import json, sys; print(json.dumps({"chat_id": sys.argv[1], "message": sys.stdin.read()}))' "$WORKER_DEPLOY_CHAT_ID")"
+          curl --fail-with-body --retry 3 -X POST 'https://worker-deploy.allcloud.top/push_message' \
+            -H 'Content-Type: application/json' \
+            -H "x-api-key: ${WORKER_DEPLOY_API_KEY}" \
+            -d "$payload"
