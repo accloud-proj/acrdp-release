@@ -164,8 +164,12 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          # Eaz uses .NET named pipes, whose socket paths are limited to 104 characters on macOS.
-          echo 'TMPDIR=/tmp' >> "$GITHUB_ENV"
+          set -euo pipefail
+          # .NET mutexes require a real directory; Eaz pipe paths must also fit within 104 bytes.
+          temporary_directory="$(mktemp -d /private/tmp/acrdp.XXXXXX)"
+          chmod 700 "$temporary_directory"
+          printf 'TMPDIR=%s\nACRDP_BUILD_TMPDIR=%s\n' \
+            "$temporary_directory" "$temporary_directory" >> "$GITHUB_ENV"
 
       - name: Enable Eazfuscator for CI
         shell: pwsh
@@ -264,6 +268,13 @@ jobs:
           name: ${{ matrix.artifact }}
           path: source/artifacts/${{ matrix.rid }}/*
           if-no-files-found: error
+
+      - name: Clean up macOS temporary directory
+        if: ${{ always() && runner.os == 'macOS' && env.ACRDP_BUILD_TMPDIR != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- "$ACRDP_BUILD_TMPDIR"
 
   release:
     needs:
