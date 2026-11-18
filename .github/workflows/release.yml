@@ -160,6 +160,13 @@ jobs:
         with:
           dotnet-version: ${{ steps.project.outputs.sdk_version }}
 
+      - name: Use short temporary path on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # Eaz uses .NET named pipes, whose socket paths are limited to 104 characters on macOS.
+          echo 'TMPDIR=/tmp' >> "$GITHUB_ENV"
+
       - name: Enable Eazfuscator for CI
         shell: pwsh
         env:
