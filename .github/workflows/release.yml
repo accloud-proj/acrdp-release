@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Source and release tag (vMAJOR.MINOR.PATCH)
+        description: Source and release tag (vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rcN)
         required: true
         type: string
 
@@ -28,6 +28,7 @@ jobs:
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
       matrix: ${{ steps.targets.outputs.matrix }}
     steps:
       - name: Validate version
@@ -37,12 +38,17 @@ jobs:
           REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          if [[ ! "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Tag must use vMAJOR.MINOR.PATCH format, got: $REQUESTED_TAG" >&2
+          if [[ ! "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+            echo "Tag must use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rcN format, got: $REQUESTED_TAG" >&2
             exit 1
           fi
           echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
           echo "version=${REQUESTED_TAG#v}" >> "$GITHUB_OUTPUT"
+          if [[ "$REQUESTED_TAG" == *-rc* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Resolve build targets
         id: targets
@@ -235,20 +241,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         shell: bash
         run: |
           set -euo pipefail
+          release_options=()
+          if [[ "$PRERELEASE" == 'true' ]]; then
+            release_options+=(--prerelease --latest=false)
+          fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release delete "$RELEASE_TAG" --yes
           fi
 
           if gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" dist/* \
+              "${release_options[@]}" \
               --verify-tag \
               --title "$RELEASE_TAG" \
               --generate-notes
           else
             gh release create "$RELEASE_TAG" dist/* \
+              "${release_options[@]}" \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_TAG" \
               --generate-notes
@@ -258,6 +271,7 @@ jobs:
         if: ${{ github.event_name == 'push' }}
         env:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
           DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
           DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
           DEPLOY_SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
@@ -346,12 +360,14 @@ jobs:
           rsync --archive --delete dist/ \
             "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST:$remote_directory/"
 
-          version="${RELEASE_TAG#v}"
-          printf '{"version":"%s"}\n' "$version" > latest.json
-          rsync --archive latest.json \
-            "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST:/www/wwwroot/accloud/acrdp/latest.json.tmp"
-          ssh "${ssh_options[@]}" "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST" \
-            "mv -f -- '/www/wwwroot/accloud/acrdp/latest.json.tmp' '/www/wwwroot/accloud/acrdp/latest.json'"
+          if [[ "$PRERELEASE" != 'true' ]]; then
+            version="${RELEASE_TAG#v}"
+            printf '{"version":"%s"}\n' "$version" > latest.json
+            rsync --archive latest.json \
+              "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST:/www/wwwroot/accloud/acrdp/latest.json.tmp"
+            ssh "${ssh_options[@]}" "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST" \
+              "mv -f -- '/www/wwwroot/accloud/acrdp/latest.json.tmp' '/www/wwwroot/accloud/acrdp/latest.json'"
+          fi
 
       - name: Send Telegram notification
         if: ${{ github.event_name == 'push' && success() }}
