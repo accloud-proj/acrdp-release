@@ -160,7 +160,7 @@ jobs:
         with:
           dotnet-version: ${{ steps.project.outputs.sdk_version }}
 
-      - name: Use short temporary path on macOS
+      - name: Prepare macOS build tools
         if: runner.os == 'macOS'
         shell: bash
         run: |
@@ -170,6 +170,37 @@ jobs:
           chmod 700 "$temporary_directory"
           printf 'TMPDIR=%s\nACRDP_BUILD_TMPDIR=%s\n' \
             "$temporary_directory" "$temporary_directory" >> "$GITHUB_ENV"
+
+          # The tagged packaging script resolves hdiutil through PATH.
+          mkdir "$temporary_directory/bin"
+          cat > "$temporary_directory/bin/hdiutil" <<'HDIUTIL'
+          #!/bin/bash
+          set -euo pipefail
+          if [[ "${1:-}" != create ]]; then
+            exec /usr/bin/hdiutil "$@"
+          fi
+
+          error_log="$(mktemp "$ACRDP_BUILD_TMPDIR/hdiutil.XXXXXX")"
+          trap 'rm -f -- "$error_log"' EXIT
+
+          for attempt in 1 2 3 4; do
+            if LC_ALL=C /usr/bin/hdiutil "$@" 2>"$error_log"; then
+              cat "$error_log" >&2
+              exit 0
+            else
+              status=$?
+            fi
+            cat "$error_log" >&2
+            if (( attempt == 4 )) || ! grep -Fxq 'hdiutil: create failed - Resource busy' "$error_log"; then
+              exit "$status"
+            fi
+            delay=$((attempt * 5))
+            echo "::warning::hdiutil create reported Resource busy (attempt $attempt/4); retrying in ${delay}s." >&2
+            sleep "$delay"
+          done
+          HDIUTIL
+          chmod 700 "$temporary_directory/bin/hdiutil"
+          printf '%s\n' "$temporary_directory/bin" >> "$GITHUB_PATH"
 
       - name: Enable Eazfuscator for CI
         shell: pwsh
