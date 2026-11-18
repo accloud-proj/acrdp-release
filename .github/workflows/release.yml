@@ -160,6 +160,41 @@ jobs:
         with:
           dotnet-version: ${{ steps.project.outputs.sdk_version }}
 
+      - name: Enable Eazfuscator for CI
+        shell: pwsh
+        env:
+          EAZFUSCATOR_NET_LICENSE: ${{ secrets.EAZFUSCATOR_NET_LICENSE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:EAZFUSCATOR_NET_LICENSE)) {
+            throw 'EAZFUSCATOR_NET_LICENSE is required for release obfuscation.'
+          }
+
+          # Use the same cross-platform NuGet integration on every runner.
+          $env:EAZFUSCATOR_NET_HOME = ''
+          'EAZFUSCATOR_NET_HOME=' >> $env:GITHUB_ENV
+          $projects = @($env:APP_PROJECT, 'CoreLib/CoreLib.csproj')
+          foreach ($project in $projects) {
+            $projectPath = Join-Path $env:SOURCE_DIR $project
+            if (-not (Test-Path $projectPath -PathType Leaf)) {
+              throw "Project to obfuscate was not found: $project"
+            }
+            dotnet add $projectPath package Gapotchenko.Eazfuscator.NET --version 2026.2.329 --no-restore
+            if ($LASTEXITCODE -ne 0) { throw "Unable to enable Eazfuscator for $project." }
+
+            $document = [xml](Get-Content $projectPath -Raw)
+            $guard = $document.CreateDocumentFragment()
+            $guard.InnerXml = @'
+          <Target Name="VerifyReleaseObfuscation" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+            <Error Condition="'$(Configuration)' != 'Release'" Text="Release packaging requires the Release configuration." />
+            <Error Condition="'$(Eazfuscator_NET_Imported)' != 'true' or '$(EazfuscatorSkipExecution)' == 'true' or '$(_Eazfuscator_NET_ExitCode)' != '0'" Text="Eazfuscator did not complete successfully for $(MSBuildProjectName). Refusing to package unprotected assemblies." />
+            <Message Importance="high" Text="Verified Eazfuscator obfuscation: $(MSBuildProjectName)" />
+          </Target>
+          '@
+            [void]$document.DocumentElement.AppendChild($guard)
+            $document.Save($projectPath)
+          }
+
       - name: Install Windows packaging tools
         if: runner.os == 'Windows'
         shell: pwsh
