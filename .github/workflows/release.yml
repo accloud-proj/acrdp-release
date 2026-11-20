@@ -55,7 +55,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          matrix='[{"runner":"windows-latest","rid":"win-x64","artifact":"windows-x64"},{"runner":"windows-latest","rid":"win-arm64","artifact":"windows-arm64"},{"runner":"ubuntu-24.04","rid":"linux-x64","artifact":"linux-x64"},{"runner":"ubuntu-24.04-arm","rid":"linux-arm64","artifact":"linux-arm64"},{"runner":"macos-15-intel","rid":"osx-x64","artifact":"macos-x64"},{"runner":"macos-15","rid":"osx-arm64","artifact":"macos-arm64"}]'
+          matrix='[{"runner":"windows-latest","rid":"win-x64","artifact":"windows-x64"},{"runner":"windows-latest","rid":"win-arm64","artifact":"windows-arm64"},{"runner":"ubuntu-24.04","rid":"linux-x64","artifact":"linux-x64"},{"runner":"ubuntu-24.04-arm","rid":"linux-arm64","artifact":"linux-arm64"},{"runner":"ubuntu-24.04","rid":"android-arm64","artifact":"android-arm64"},{"runner":"macos-15-intel","rid":"osx-x64","artifact":"macos-x64"},{"runner":"macos-15","rid":"osx-arm64","artifact":"macos-arm64"}]'
           echo "matrix={\"include\":$matrix}" >> "$GITHUB_OUTPUT"
 
   build:
