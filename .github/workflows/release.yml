@@ -132,8 +132,13 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'The pinned Gitea host key is invalid.' }
 
             $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=`"$knownHosts`" -i `"$privateKey`""
-            git clone --depth 1 --branch $env:SOURCE_TAG $env:GITEA_SOURCE_REPOSITORY $env:SOURCE_DIR
+            # Fetch only the requested tag: multiple tags may point at the same commit.
+            git clone --depth 1 --no-tags --branch $env:SOURCE_TAG $env:GITEA_SOURCE_REPOSITORY $env:SOURCE_DIR
             if ($LASTEXITCODE -ne 0) { throw "Unable to clone source tag $env:SOURCE_TAG." }
+            $resolvedTag = git -C $env:SOURCE_DIR describe --tags --exact-match HEAD
+            if ($LASTEXITCODE -ne 0 -or $resolvedTag -cne $env:SOURCE_TAG) {
+              throw "The packaging script would resolve tag '$resolvedTag' instead of '$env:SOURCE_TAG'."
+            }
           }
           finally {
             Remove-Item -Recurse -Force $sshDirectory -ErrorAction SilentlyContinue
