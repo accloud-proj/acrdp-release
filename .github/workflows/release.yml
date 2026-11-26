@@ -70,7 +70,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          matrix='[{"runner":"windows-latest","rid":"win-x64","artifact":"windows-x64"},{"runner":"windows-latest","rid":"win-arm64","artifact":"windows-arm64"},{"runner":"ubuntu-24.04","rid":"linux-x64","artifact":"linux-x64"},{"runner":"ubuntu-24.04-arm","rid":"linux-arm64","artifact":"linux-arm64"},{"runner":"ubuntu-24.04","rid":"android-arm64","artifact":"android-arm64"},{"runner":"macos-15-intel","rid":"osx-x64","artifact":"macos-x64"},{"runner":"macos-15","rid":"osx-arm64","artifact":"macos-arm64"}]'
+          matrix='[{"runner":"windows-latest","rid":"win-x64","artifact":"windows-x64","output":"win-x64","no_update":false},{"runner":"windows-latest","rid":"win-arm64","artifact":"windows-arm64","output":"win-arm64","no_update":false},{"runner":"windows-latest","rid":"win-x64","artifact":"windows-x64-no-update","output":"win-x64-no-update","no_update":true},{"runner":"windows-latest","rid":"win-arm64","artifact":"windows-arm64-no-update","output":"win-arm64-no-update","no_update":true},{"runner":"ubuntu-24.04","rid":"linux-x64","artifact":"linux-x64","output":"linux-x64","no_update":false},{"runner":"ubuntu-24.04-arm","rid":"linux-arm64","artifact":"linux-arm64","output":"linux-arm64","no_update":false},{"runner":"ubuntu-24.04","rid":"android-arm64","artifact":"android-arm64","output":"android-arm64","no_update":false},{"runner":"macos-15-intel","rid":"osx-x64","artifact":"macos-x64","output":"osx-x64","no_update":false},{"runner":"macos-15","rid":"osx-arm64","artifact":"macos-arm64","output":"osx-arm64","no_update":false}]'
           echo "matrix={\"include\":$matrix}" >> "$GITHUB_OUTPUT"
 
   build:
@@ -185,7 +185,7 @@ jobs:
         uses: actions/setup-java@v5
         with:
           distribution: microsoft
-          java-version: '21'
+          java-version: "21"
 
       - name: Install Android build tools
         if: matrix.rid == 'android-arm64'
@@ -311,10 +311,16 @@ jobs:
         shell: pwsh
         env:
           RID: ${{ matrix.rid }}
+          NO_UPDATE: ${{ matrix.no_update }}
           EAZFUSCATOR_NET_LICENSE: ${{ secrets.EAZFUSCATOR_NET_LICENSE }}
         run: |
           $ErrorActionPreference = 'Stop'
-          ./packaging/build-package.ps1 -RuntimeIdentifier $env:RID -ArtifactsDirectory artifacts
+          $packageOptions = @{
+            RuntimeIdentifier = $env:RID
+            ArtifactsDirectory = 'artifacts'
+          }
+          if ($env:NO_UPDATE -eq 'true') { $packageOptions.NoUpdate = $true }
+          ./packaging/build-package.ps1 @packageOptions
 
       - name: Build signed Android APK
         if: matrix.rid == 'android-arm64'
@@ -358,12 +364,12 @@ jobs:
       - name: Generate SHA-256 files
         shell: pwsh
         env:
-          RID: ${{ matrix.rid }}
+          OUTPUT: ${{ matrix.output }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $outputDirectory = Join-Path $env:SOURCE_DIR "artifacts/$env:RID"
+          $outputDirectory = Join-Path $env:SOURCE_DIR "artifacts/$env:OUTPUT"
           $packages = @(Get-ChildItem $outputDirectory -File | Where-Object Extension -ne '.sha256')
-          if ($packages.Count -eq 0) { throw "No installer packages were created for $env:RID." }
+          if ($packages.Count -eq 0) { throw "No installer packages were created for $env:OUTPUT." }
           foreach ($package in $packages) {
             $hash = (Get-FileHash $package.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             [IO.File]::WriteAllText(
@@ -376,7 +382,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: source/artifacts/${{ matrix.rid }}/*
+          path: source/artifacts/${{ matrix.output }}/*
           if-no-files-found: error
 
       - name: Clean up macOS temporary directory
